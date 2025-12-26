@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+
+import os
 import httpx
 import json
 import argparse
@@ -9,21 +11,14 @@ import sys
 from prettytable import PrettyTable
 
 # ======================================================
-# CONFIG
-# ======================================================
-URL = "https://YOUR_API_ENDPOINT/v1/chat/completions"
-HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": "Bearer YOUR_API_KEY"
-}
-
-# ======================================================
 # TERMINAL
 # ======================================================
 class Terminal:
     def __init__(self):
-        self.width = shutil.get_terminal_size((80, 20)).columns
         self.ansi = sys.stdout.isatty()
+
+    def width(self):
+        return shutil.get_terminal_size((80, 20)).columns
 
     def color(self, code):
         return code if self.ansi else ""
@@ -68,7 +63,7 @@ class Renderer:
         styled = Markdown.style(line.rstrip("\n"))
         wrapped = textwrap.fill(
             styled,
-            width=TERM.width,
+            width=TERM.width(),
             replace_whitespace=False,
             drop_whitespace=False
         )
@@ -78,47 +73,35 @@ class Renderer:
     def table(markdown_block: str):
         lines = [l.rstrip() for l in markdown_block.splitlines() if l.strip()]
         headers = [h.strip() for h in lines[0].strip("|").split("|")]
-        
+
         rows = []
         for row in lines[2:]:
-            if "|" not in row:
-                continue
-            rows.append([c.strip() for c in row.strip("|").split("|")])
-            
-        # === HITUNG LEBAR TERMINAL REAL-TIME ===
-        term_width = shutil.get_terminal_size((80, 20)).columns
+            if "|" in row:
+                rows.append([c.strip() for c in row.strip("|").split("|")])
+
+        term_width = TERM.width()
         col_count = len(headers)
-        
-        # margin + border estimation
-        max_col_width = max(
-            10,
-            (term_width - (col_count + 1) * 3) // col_count
-        )
-        
-        # === DETEKSI KOLOM NUMERIK ===
-        def is_numeric_column(col_idx):
+        max_col_width = max(10, (term_width - (col_count + 1) * 3) // col_count)
+
+        def is_numeric_column(idx):
             for r in rows:
-                v = re.sub(r"[,%\s]", "", r[col_idx])
+                v = re.sub(r"[,%\s]", "", r[idx])
                 if not v.replace(".", "").isdigit():
                     return False
             return True
-        
-        numeric_cols = {
-            idx for idx in range(col_count) if is_numeric_column(idx)
-        }
-        
-        # === RENDER HEADER ===
+
+        numeric_cols = {i for i in range(col_count) if is_numeric_column(i)}
+
         styled_headers = [Markdown.style(h) for h in headers]
         table = PrettyTable(styled_headers)
-        
+
         for i, h in enumerate(styled_headers):
-            table.max_width[h] = max_col_width
             table.align[h] = "r" if i in numeric_cols else "l"
-            
-        # === RENDER ROW ===
+            table.max_width[h] = max_col_width
+
         for r in rows:
             rendered = []
-            for idx, cell in enumerate(r):
+            for cell in r:
                 styled = Markdown.style(cell)
                 wrapped = "\n".join(
                     textwrap.wrap(
@@ -132,7 +115,7 @@ class Renderer:
                 )
                 rendered.append(wrapped)
             table.add_row(rendered)
-            
+
         print(table)
 
 # ======================================================
@@ -181,7 +164,7 @@ class TableState:
         return None
 
 # ======================================================
-# STREAM COLLECTOR (RETURNS FULL TEXT)
+# STREAM COLLECTOR
 # ======================================================
 class StreamCollector:
     def __init__(self):
@@ -208,14 +191,10 @@ class StreamCollector:
 
             while "\n" in self.partial:
                 line, self.partial = self.partial.split("\n", 1)
-                line = line.rstrip("\n")
-
                 result = self.table.feed(line)
 
                 if result == "NO":
                     Renderer.prose(line)
-                elif result == "HOLD":
-                    continue
                 elif isinstance(result, tuple):
                     if result[0] == "FLUSH_BACK":
                         for l in result[1]:
@@ -234,9 +213,60 @@ class StreamCollector:
             Renderer.prose(self.partial)
 
         return self.full_text
+    
+    def collect_text(self, text: str):
+        """
+        Process full text (non-stream) through the same rendering pipeline
+        """
+        self.partial = text
+        self.full_text = text
+        
+        while "\n" in self.partial:
+            line, self.partial = self.partial.split("\n", 1)
+            result = self.table.feed(line)
+            
+            if result == "NO":
+                Renderer.prose(line)
+            elif isinstance(result, tuple):
+                if result[0] == "FLUSH_BACK":
+                    for l in result[1]:
+                        Renderer.prose(l)
+                    Renderer.prose(line)
+                elif result[0] == "FLUSH_TABLE":
+                    Renderer.table("\n".join(result[1]))
+                    if result[2]:
+                        Renderer.prose(result[2])
+                        
+        tail = self.table.flush_tail()
+        if tail:
+            Renderer.table("\n".join(tail[1]))
+            
+        if self.partial.strip():
+            Renderer.prose(self.partial)
 
 # ======================================================
-# SESSION CONFIG & MEMORY
+# RAW HELPERS
+# ======================================================
+def stream_raw(response):
+    for raw in response.iter_lines():
+        if raw and raw.startswith("data: "):
+            data = raw[6:]
+            if data == "[DONE]":
+                break
+            chunk = json.loads(data)
+            content = chunk["choices"][0]["delta"].get("content")
+            if content:
+                sys.stdout.write(content)
+                sys.stdout.flush()
+
+def inferensi_raw(payload, endpoint, headers):
+    with httpx.Client(timeout=60) as client:
+        r = client.post(endpoint, headers=headers, json=payload)
+        r.raise_for_status()
+        print(r.json()["choices"][0]["message"]["content"])
+
+# ======================================================
+# INTERACTIVE
 # ======================================================
 class SessionConfig:
     def __init__(self, max_tokens, temperature, top_p, system_prompt, history):
@@ -253,12 +283,7 @@ class Conversation:
 
     def add(self, role, content):
         self.messages.append({"role": role, "content": content})
-        self.trim()
-
-    def trim(self):
-        max_len = self.max_pairs * 2
-        if len(self.messages) > max_len:
-            self.messages = self.messages[-max_len:]
+        self.messages = self.messages[-self.max_pairs * 2 :]
 
     def build(self, system_prompt):
         msgs = []
@@ -267,38 +292,9 @@ class Conversation:
         msgs.extend(self.messages)
         return msgs
 
-# ======================================================
-# INTERACTIVE
-# ======================================================
-def handle_cmd(line, cfg, convo):
-    parts = line.split(maxsplit=2)
-    if len(parts) < 2:
-        return
-
-    cmd = parts[1]
-    val = parts[2] if len(parts) > 2 else None
-
-    if cmd == "temperature":
-        cfg.temperature = float(val)
-    elif cmd == "top_p":
-        cfg.top_p = float(val)
-    elif cmd == "max_tokens":
-        cfg.max_tokens = int(val)
-    elif cmd == "history":
-        convo.max_pairs = int(val)
-        convo.trim()
-    elif cmd == "system_prompt":
-        cfg.system_prompt = val
-    elif cmd == "show":
-        print(cfg.__dict__)
-    elif cmd == "help":
-        print("/cmd temperature|top_p|max_tokens|history|system_prompt|show|help")
-    else:
-        print("unknown command")
-
-def interactive_loop(model, cfg):
+def interactive_loop(model, cfg, endpoint, headers):
     convo = Conversation(cfg.history)
-    print("Interactive mode. Type /cmd help\n")
+    print("Interactive mode. Type /cmd help or /bye\n")
 
     while True:
         try:
@@ -307,20 +303,19 @@ def interactive_loop(model, cfg):
             print("\nbye.")
             break
 
-        if not user:
-            continue
-        
         if user == "/bye":
-            print("\nbye 👋")
-            print("")
+            print("\nbye 👋\n")
             break
 
+        if not user:
+            continue
+
         if user.startswith("/cmd"):
-            handle_cmd(user, cfg, convo)
+            print("Use CLI args for config in interactive.")
             continue
 
         convo.add("user", user)
-        print()  # baris kosong sebelum respons model
+        print()
 
         payload = {
             "model": model,
@@ -328,73 +323,97 @@ def interactive_loop(model, cfg):
             "max_tokens": cfg.max_tokens,
             "temperature": cfg.temperature,
             "top_p": cfg.top_p,
-            "stream": True
+            "stream": True,
         }
 
         with httpx.Client(timeout=None) as client:
-            with client.stream("POST", URL, headers=HEADERS, json=payload) as r:
+            with client.stream("POST", endpoint, headers=headers, json=payload) as r:
                 r.raise_for_status()
                 text = StreamCollector().collect(r)
 
         convo.add("assistant", text)
-        print()  # baris kosong setelah respons model
+        print()
 
 # ======================================================
 # CLI
 # ======================================================
 def main():
-    p = argparse.ArgumentParser("terminal-chat v0.2")
-    p.add_argument("-p", "--prompt")
-    p.add_argument("-i", "--interactive", action="store_true")
-    p.add_argument("-m", "--model", default="tugasi-chat")
-    p.add_argument("--max-tokens", type=int, default=4096)
-    p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--top-p", type=float, default=0.95)
-    p.add_argument("--system-prompt")
-    p.add_argument("--history", type=int, default=10)
+    p = argparse.ArgumentParser(
+        "chat-cli v0.3",
+        description="Streaming AI chat CLI with rich terminal rendering",
+    )
+
+    p.add_argument("-p", "--prompt", help="One-shot prompt (CLI mode)")
+    p.add_argument("-i", "--interactive", action="store_true", help="Interactive chat mode")
+    p.add_argument("-m", "--model", default="tugasi-chat", help="Model name")
+    p.add_argument("--max-tokens", type=int, default=4096, help="Max tokens")
+    p.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    p.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling")
+    p.add_argument("--system-prompt", help="System prompt")
+    p.add_argument("--history", type=int, default=10, help="History pairs (interactive)")
+    p.add_argument("-r", "--raw", action="store_true", help="Raw output (CLI only)")
+    p.add_argument("--no-stream", action="store_true", help="Disable streaming (CLI only)")
+
     args = p.parse_args()
+
+    if len(sys.argv) == 1:
+        p.print_help()
+        sys.exit(0)
+
+    endpoint = os.environ.get("CHAT_CLI_ENDPOINT")
+    api_key = os.environ.get("CHAT_CLI_KEY")
+
+    if not endpoint or not api_key:
+        print("Error: CHAT_CLI_ENDPOINT and CHAT_CLI_KEY must be set")
+        sys.exit(1)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
 
     cfg = SessionConfig(
         args.max_tokens,
         args.temperature,
         args.top_p,
         args.system_prompt,
-        args.history
+        args.history,
     )
 
     if args.interactive:
-        interactive_loop(args.model, cfg)
-    else:
-        payload = {
-            "model": args.model,
-            "messages": (
-                [{"role": "system", "content": cfg.system_prompt}] if cfg.system_prompt else []
-            ) + [{"role": "user", "content": args.prompt}],
-            "max_tokens": cfg.max_tokens,
-            "temperature": cfg.temperature,
-            "top_p": cfg.top_p,
-            "stream": runtime.stream
-        }
-        
-        with httpx.Client(timeout=None) as client:
-            if runtime.raw:
-                if runtime.stream:
-                    with client.stream("POST", endpoint, headers=headers, json=payload) as r:
-                        r.raise_for_status()
-                        stream_raw(r)
-                else:
-                    inferensi_raw(payload, endpoint, headers)
+        interactive_loop(args.model, cfg, endpoint, headers)
+        return
+
+    payload = {
+        "model": args.model,
+        "messages": (
+            [{"role": "system", "content": cfg.system_prompt}] if cfg.system_prompt else []
+        ) + [{"role": "user", "content": args.prompt}],
+        "max_tokens": cfg.max_tokens,
+        "temperature": cfg.temperature,
+        "top_p": cfg.top_p,
+        "stream": not args.no_stream,
+    }
+
+    with httpx.Client(timeout=None) as client:
+        if args.raw:
+            if args.no_stream:
+                inferensi_raw(payload, endpoint, headers)
             else:
-                if runtime.stream:
-                    with client.stream("POST", endpoint, headers=headers, json=payload) as r:
-                        r.raise_for_status()
-                        StreamCollector().collect(r)
-                else:
-                    with client.post(endpoint, headers=headers, json=payload) as r:
-                        r.raise_for_status()
-                        text = r.json()["choices"][0]["message"]["content"]
-                        Renderer.prose(text)
+                with client.stream("POST", endpoint, headers=headers, json=payload) as r:
+                    r.raise_for_status()
+                    stream_raw(r)
+        else:
+            if args.no_stream:
+                r = client.post(endpoint, headers=headers, json=payload)
+                r.raise_for_status()
+                
+                text = r.json()["choices"][0]["message"]["content"]
+                StreamCollector().collect_text(text)
+            else:
+                with client.stream("POST", endpoint, headers=headers, json=payload) as r:
+                    r.raise_for_status()
+                    StreamCollector().collect(r)
 
 if __name__ == "__main__":
     main()
-    
