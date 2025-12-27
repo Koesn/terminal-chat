@@ -1,19 +1,23 @@
 # terminal-chat
 
-An OpenAI-compatible command-line chat client with streaming, rich terminal rendering, and interactive mode support.
+A terminal-based, OpenAI-compatible chat client designed for both human-friendly interaction and automation workflows.
+
+`terminal-chat` supports streaming responses, rich terminal rendering (Markdown and tables), raw output for pipelines, and an interactive REPL mode.
 
 ---
 
 ## Features
 
-- Streaming response output
+- Streaming response output (default)
 - Optional non-streaming mode
+- Raw output mode for automation and piping
 - Markdown-aware terminal rendering (bold, italic, numbering)
-- Automatic table detection and rendering (PrettyTable)
+- Automatic Markdown table detection and rendering (PrettyTable)
 - Adaptive table width based on terminal size
 - Numeric column right-alignment in tables
 - Interactive (REPL) mode with conversation history
-- Runtime parameter control in interactive mode (`/cmd`)
+- Configurable conversation history depth
+- System prompt support
 - Compatible with OpenAI-style Chat Completion API
 
 ---
@@ -37,39 +41,72 @@ chmod +x terminal-chat.py
 
 ---
 
-Configuration
+## Configuration
 
-Edit the script and set your API endpoint and API key:
+terminal-chat reads configuration from environment variables.
 
-URL = "https://YOUR_API_ENDPOINT/v1/chat/completions"
-HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": "Bearer YOUR_API_KEY"
-}
-
+Set the API endpoint and API key:
+```bash
+export CHAT_CLI_ENDPOINT="https://YOUR_API_ENDPOINT/v1/chat/completions"
+export CHAT_CLI_KEY="YOUR_API_KEY"
+```
+These variables must be set before running the CLI.
 
 ---
 
-Usage
+## Usage
 
-Streaming mode (default)
+### Basic usage (streaming mode)
 ```bash
 ./terminal-chat.py -p "Explain artificial intelligence in simple terms"
 ```
-Specify model
+### Specify model
 ```bash
 ./terminal-chat.py -p "Explain the rule of law" -m tugasi-chat
 ```
-Non-streaming mode
+### Non-streaming mode
+Wait for the full response before rendering (useful for clean tables):
 ```bash
 ./terminal-chat.py -p "Explain fintech regulation in Indonesia" --no-stream
 ```
-Interactive mode
+### Raw output mode (automation-friendly)
+
+Disable all terminal formatting.
+
+### Non-streaming raw output:
+```bash
+./terminal-chat.py -p "Summarize contract law in 5 points" --raw --no-stream
+```
+### Streaming raw output:
+```bash
+./terminal-chat.py -p "Explain AI alignment" --raw
+```
+### System prompt
+
+Control model behavior:
+```bash
+./terminal-chat.py \
+  -p "Analyze legal risk of a startup" \
+  --system-prompt "You are a legal analyst. Answer concisely and structurally."
+```
+### Sampling parameters
+```bash
+./terminal-chat.py \
+  -p "Generate a policy outline" \
+  --temperature 0.2 \
+  --top-p 0.9
+```
+### Interactive mode
 ```bash
 ./terminal-chat.py --interactive
 ```
-Inside interactive mode:
-	•	Type prompts directly after >
-	•	Use /cmd help to see available runtime commands
-	•	Use /bye to exit
+In interactive mode:
+- Type prompts after >
+- Conversation history is preserved automatically
+- Use /bye to exit
+### Command-Line Help
 
+Run without arguments to see full help:
+```bash
+./terminal-chat.py
+```
