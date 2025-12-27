@@ -13,6 +13,11 @@ import sys
 from prettytable import PrettyTable
 import atexit
 
+# ======================================================
+# CONVERSATION HISTORY
+# ======================================================
+CONVERSATION_STORE_LIMIT = 1000  # jumlah MESSAGE, bukan pair
+CONVERSATION_FILE = os.path.expanduser("~/.terminal-chat-conversation.json")
 HISTORY_FILE = os.path.expanduser("~/.terminal-chat-history")
 
 try:
@@ -61,16 +66,16 @@ class Markdown:
             text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
             text = re.sub(r"\*(.+?)\*", r"\1", text)
             
+            # remove blockquote marker '>'
+            text = re.sub(r"^\s*>\s?", "", text)
+            
             # strip heading hashes but KEEP the text
             text = re.sub(r"^#{1,6}\s+", "", text)
             
-            # markdown horizontal rule (---, ----, etc) → remove
+            # drop horizontal rules entirely (---, ----, etc)
             if re.match(r"^\s*-{3,}\s*$", text):
                 return None
             
-            # remove blockquote marker '>'
-                text = re.sub(r"^\s*>\s?", "", text)
-                
             return text.rstrip()
         
         # PLAIN MODE: no ANSI, no transformation
@@ -119,71 +124,124 @@ class Renderer:
 
     @staticmethod
     def table(markdown_block: str):
+        # ======================================================
+        # PARSE MARKDOWN TABLE
+        # ======================================================
         lines = [l.rstrip() for l in markdown_block.splitlines() if l.strip()]
         headers = [h.strip() for h in lines[0].strip("|").split("|")]
-
+        
         rows = []
         for row in lines[2:]:
             if "|" in row:
                 rows.append([c.strip() for c in row.strip("|").split("|")])
-
-        term_width = TERM.width()
+                
         col_count = len(headers)
-        max_col_width = max(10, (term_width - (col_count + 1) * 3) // col_count)
-
+        
+        # ======================================================
+        # DETECT NUMERIC COLUMNS
+        # ======================================================
         def is_numeric_column(idx):
             for r in rows:
+                if idx >= len(r):
+                    return False
                 v = re.sub(r"[,%\s]", "", r[idx])
                 if not v.replace(".", "").isdigit():
                     return False
             return True
-
+        
         numeric_cols = {i for i in range(col_count) if is_numeric_column(i)}
-
-        styled_headers = [Markdown.style(h) for h in headers]
-        table = PrettyTable(styled_headers)
-
-        for i, h in enumerate(styled_headers):
-            table.align[h] = "r" if i in numeric_cols else "l"
-            table.max_width[h] = max_col_width
-
+        
+        # ======================================================
+        # NORMALIZE ROWS
+        # ======================================================
+        normalized_rows = []
         for r in rows:
-            # NORMALISASI JUMLAH KOLOM
             if len(r) < col_count:
                 r = r + [""] * (col_count - len(r))
             elif len(r) > col_count:
                 r = r[:col_count]
-                
+            normalized_rows.append(r)
+            
+        styled_headers = [Markdown.style(h) for h in headers]
+        
+        # ======================================================
+        # PASS 1 — BUILD TABLE WITHOUT WRAPPING
+        # ======================================================
+        table = PrettyTable(styled_headers)
+        
+        for i, h in enumerate(styled_headers):
+            table.align[h] = "r" if i in numeric_cols else "l"
+            
+        for r in normalized_rows:
+            table.add_row([
+                Markdown.style(cell) if cell else ""
+                for cell in r
+            ])
+            
+        # Render once to let PrettyTable decide natural widths
+        table_str = table.get_string()
+        
+        # ======================================================
+        # EXTRACT COLUMN WIDTHS (STABLE METHOD)
+        # ======================================================
+        first_border = table_str.splitlines()[0]
+        raw_widths = [
+            len(seg)
+            for seg in first_border.split("+")[1:-1]
+        ]
+        
+        # ======================================================
+        # APPLY HARD CAP FOR READABILITY
+        # ======================================================
+        HARD_MAX_COL_WIDTH = 35  # ← keputusan desain final
+        
+        col_widths = []
+        for idx, header in enumerate(headers):
+            header_len = len(header)
+            natural = raw_widths[idx]
+            
+            col_widths.append(
+                min(
+                    HARD_MAX_COL_WIDTH,
+                    max(header_len + 2, natural)
+                )
+            )
+            
+        # ======================================================
+        # PASS 2 — REBUILD TABLE WITH WRAPPING
+        # ======================================================
+        table = PrettyTable(styled_headers)
+        
+        for i, h in enumerate(styled_headers):
+            table.align[h] = "r" if i in numeric_cols else "l"
+            
+        for r in normalized_rows:
             rendered = []
-            for cell in r:
+            for idx, cell in enumerate(r):
                 styled = Markdown.style(cell)
+                
+                # normalize HTML <br> into newline
+                if styled:
+                    styled = re.sub(r"<br\s*/?>", "\n", styled, flags=re.IGNORECASE)
+                    
+                wrap_width = max(5, col_widths[idx] - 2)  # padding
+                
                 wrapped = "\n".join(
-                    textwrap.wrap(
-                        styled,
-                        width=max_col_width,
+                    line.rstrip()
+                    for line in textwrap.wrap(
+                        styled or "",
+                        width=wrap_width,
                         break_long_words=False,
                         break_on_hyphens=False,
                         replace_whitespace=False,
                         drop_whitespace=False,
                     )
                 )
+                
                 rendered.append(wrapped)
                 
-            
-            wrapped = "\n".join(
-                line.rstrip()
-                for line in textwrap.wrap(
-                    styled,
-                    width=max_col_width,
-                    break_long_words=False,
-                    break_on_hyphens=False,
-                    replace_whitespace=False,
-                    drop_whitespace=False,
-                )
-            )
-            
             table.add_row(rendered)
-
+            
         print(table)
 
 # ======================================================
@@ -334,10 +392,98 @@ def inferensi_raw(payload, endpoint, headers):
         print(r.json()["choices"][0]["message"]["content"])
 
 # ======================================================
+# ERROR HANDLING
+# ======================================================
+
+def handle_http_error(e: httpx.HTTPStatusError, endpoint: str, model: str):
+    status = e.response.status_code
+    reason = e.response.reason_phrase
+    
+    print()
+    print(f"❌ Request failed (HTTP {status} {reason})")
+    print()
+    print("Possible causes:")
+    if status == 401:
+        print("- Invalid or missing API key")
+    elif status == 404:
+        print("- Endpoint not found")
+        print("- Model name not recognized by server")
+    elif status == 400:
+        print("- Invalid request payload")
+        print("- Model not supported by endpoint")
+    elif status >= 500:
+        print("- Server error on remote endpoint")
+        
+    print()
+    print(f"Endpoint: {endpoint}")
+    print(f"Model: {model}")
+    print()
+    print("Tip: check TERMINAL_CHAT_ENDPOINT, TERMINAL_CHAT_KEY, TERMINAL_CHAT_MODEL")
+    print()
+
+# ======================================================
+# ENVIRONMENT STATUS
+# ======================================================
+def print_env_status():
+    endpoint = os.environ.get("TERMINAL_CHAT_ENDPOINT")
+    api_key = os.environ.get("TERMINAL_CHAT_KEY")
+    model = os.environ.get("TERMINAL_CHAT_MODEL")
+    
+    print("\nEnvironment status:")
+    
+    print(f"  TERMINAL_CHAT_ENDPOINT = {endpoint or '<NOT SET>'}")
+    print(f"  TERMINAL_CHAT_MODEL    = {model or '<NOT SET>'}")
+    
+    if api_key:
+        masked = api_key[:4] + "..." + api_key[-4:] if len(api_key) > 8 else "***"
+        print(f"  TERMINAL_CHAT_KEY      = {masked}")
+    else:
+        print("  TERMINAL_CHAT_KEY      = <NOT SET>")
+        
+    print()
+
+# ======================================================
+# CONVERSATION PERSISTENCE (CRASH-SAFE)
+# ======================================================
+def load_conversation_history():
+    """
+    Load FULL stored conversation (bounded by store limit).
+    Context slicing happens elsewhere.
+    """
+    if not os.path.exists(CONVERSATION_FILE):
+        return []
+    
+    try:
+        with open(CONVERSATION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+        if not isinstance(data, list):
+            return []
+        
+        return data[-CONVERSATION_STORE_LIMIT:]
+    
+    except Exception:
+        return []
+    
+    
+def save_conversation_history(messages):
+    """
+    Persist conversation incrementally.
+    """
+    try:
+        trimmed = messages[-CONVERSATION_STORE_LIMIT:]
+        with open(CONVERSATION_FILE, "w", encoding="utf-8") as f:
+            json.dump(trimmed, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+        
+        
+# ======================================================
 # INTERACTIVE
 # ======================================================
 class SessionConfig:
-    def __init__(self, max_tokens, temperature, top_p, system_prompt, history):
+    def __init__(self, model, max_tokens, temperature, top_p, system_prompt, history):
+        self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
@@ -354,24 +500,40 @@ class Conversation:
         self.messages = self.messages[-self.max_pairs * 2 :]
 
     def build(self, system_prompt):
+        """
+        Build context window for LLM (bounded by max_pairs),
+        NOT full stored history.
+        """
         msgs = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
-        msgs.extend(self.messages)
+            
+        msgs.extend(self.messages[-self.max_pairs * 2 :])
         return msgs
 
 def interactive_loop(model, cfg, endpoint, headers):
     convo = Conversation(cfg.history)
-    print('Welcome to Terminal Chat v0.3.2.\nType "/cmd help" to engage command or "/bye" to end chat.\n')
+    
+    # LOAD persistent conversation history
+    convo.messages = load_conversation_history()
+    print(
+        'Welcome to Terminal Chat v0.4.0.\n'
+        'Type "/cmd help" to engage command or "/bye" to end chat.\n'
+        f'Conversation restored. '
+        f'Storage cap {CONVERSATION_STORE_LIMIT} messages. '
+        f'Context cap {cfg.history} pairs.\n'
+    )
 
     while True:
         try:
             user = input("> ").strip()
         except EOFError:
+            save_conversation_history(convo.messages)
             print("\nbye.")
             break
 
         if user == "/bye":
+            save_conversation_history(convo.messages)
             print("\nbye 👋\n")
             break
 
@@ -386,7 +548,7 @@ def interactive_loop(model, cfg, endpoint, headers):
         print()
 
         payload = {
-            "model": model,
+            "model": cfg.model,
             "messages": convo.build(cfg.system_prompt),
             "max_tokens": cfg.max_tokens,
             "temperature": cfg.temperature,
@@ -395,11 +557,33 @@ def interactive_loop(model, cfg, endpoint, headers):
         }
 
         with httpx.Client(timeout=None) as client:
-            with client.stream("POST", endpoint, headers=headers, json=payload) as r:
-                r.raise_for_status()
-                text = StreamCollector().collect(r)
-
+            try:
+                with client.stream(
+                    "POST",
+                    endpoint,
+                    headers=headers,
+                    json=payload
+                ) as r:
+                    r.raise_for_status()
+                    text = StreamCollector().collect(r)
+                
+            except httpx.HTTPStatusError as e:
+                handle_http_error(e, endpoint, cfg.model)
+                return
+            
+            except httpx.RequestError as e:
+                print()
+                print("❌ Network error while connecting to endpoint")
+                print(f"Detail: {e}")
+                print()
+                return
+                
+        # COMPLETE PAIR: user + assistant
         convo.add("assistant", text)
+        
+        # 🔐 SAVE IMMEDIATELY (CRASH-SAFE)
+        save_conversation_history(convo.messages)
+        
         print()
 
 def handle_cmd(line, cfg, convo):
@@ -421,6 +605,7 @@ def handle_cmd(line, cfg, convo):
         elif cmd == "history":
             convo.max_pairs = int(val)
             convo.messages = convo.messages[-convo.max_pairs * 2 :]
+            save_conversation_history(convo.messages)
         elif cmd == "system_prompt":
             cfg.system_prompt = val
         elif cmd == "show":
@@ -441,6 +626,11 @@ def handle_cmd(line, cfg, convo):
                 "/cmd show\n"
                 "/cmd help"
             )
+        elif cmd == "model":
+            if not val:
+                print("Usage: /cmd model <model_name>")
+                return
+            cfg.model = val
         else:
             print("Unknown command. Type /cmd help.")
     except Exception as e:
@@ -475,96 +665,109 @@ def read_stdin():
 # ======================================================
 def main():
     p = argparse.ArgumentParser(
-        "terminal-chat v0.3",
+        "terminal-chat v0.4.0",
         description="Streaming AI chat CLI with rich terminal rendering",
     )
-
+    
     p.add_argument("-p", "--prompt", help="One-shot prompt (CLI mode)")
     p.add_argument("-i", "--interactive", action="store_true", help="Interactive chat mode")
-    p.add_argument("-m", "--model", default="tugasi-chat", help="Model name")
-    p.add_argument("--max-tokens", type=int, default=4096, help="Max tokens")
-    p.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
-    p.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling")
-    p.add_argument("--system-prompt", help="System prompt")
-    p.add_argument("--history", type=int, default=10, help="History pairs (interactive)")
-    p.add_argument("-r", "--raw", action="store_true", help="Raw output (CLI only)")
-    p.add_argument("--no-stream", action="store_true", help="Disable streaming (CLI only)")
-    p.add_argument("--style", choices=["rich", "plain", "clean"], default="rich", help="Output style: rich, plain, or clean (human-readable)")
-
+    p.add_argument("-m", "--model", help="Model name (override TERMINAL_CHAT_MODEL)")
+    p.add_argument("--max-tokens", type=int, default=4096)
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--system-prompt")
+    p.add_argument("--history", type=int, default=4)
+    p.add_argument("-r", "--raw", action="store_true")
+    p.add_argument("--no-stream", action="store_true")
+    p.add_argument("--style", choices=["rich", "plain", "clean"], default="rich")
+    
     args = p.parse_args()
+    
+    # ======================================================
+    # STYLE MODE
+    # ======================================================
     global STYLE_MODE
     STYLE_MODE = args.style
-    
     if args.style in ("plain", "clean"):
         TERM.disable_ansi()
-    
+        
+    # ======================================================
+    # READ STDIN (DEFINE EARLY)
+    # ======================================================
     stdin_text = read_stdin()
     
+    # ======================================================
+    # NO-ARG HELP
+    # ======================================================
     if len(sys.argv) == 1 and not stdin_text:
         p.print_help()
+        print_env_status()
         sys.exit(0)
-
-    endpoint = os.environ.get("CHAT_CLI_ENDPOINT")
-    api_key = os.environ.get("CHAT_CLI_KEY")
-
-    if not endpoint or not api_key:
-        print("Error: CHAT_CLI_ENDPOINT and CHAT_CLI_KEY must be set")
+        
+    # ======================================================
+    # ENVIRONMENT VARIABLES
+    # ======================================================
+    endpoint = os.environ.get("TERMINAL_CHAT_ENDPOINT")
+    api_key = os.environ.get("TERMINAL_CHAT_KEY")
+    env_model = os.environ.get("TERMINAL_CHAT_MODEL")
+    
+    # ======================================================
+    # MODEL RESOLUTION (ARG > ENV)
+    # ======================================================
+    model = args.model or env_model
+    if not model:
+        print("Error: No model specified.")
+        print('Set TERMINAL_CHAT_MODEL or use --model or "/cmd model"')
         sys.exit(1)
-
+        
+    if not endpoint or not api_key:
+        print("Error: TERMINAL_CHAT_ENDPOINT and TERMINAL_CHAT_KEY must be set.")
+        sys.exit(1)
+        
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
-
+    
     cfg = SessionConfig(
+        model,
         args.max_tokens,
         args.temperature,
         args.top_p,
         args.system_prompt,
         args.history,
     )
-
+    
+    # ======================================================
+    # INTERACTIVE MODE
+    # ======================================================
     if args.interactive:
-        interactive_loop(args.model, cfg, endpoint, headers)
+        interactive_loop(model, cfg, endpoint, headers)
         return
-
-    user_content = None
     
+    # ======================================================
+    # ONE-SHOT / PIPE MODE
+    # ======================================================
     if stdin_text and args.prompt:
-        user_content = (
-            "[KONTEKS]:\n"
-            f"{stdin_text}\n\n"
-            "[INPUT]:\n"
-            f"{args.prompt}"
-        )
-    elif stdin_text:
-        user_content = stdin_text
+        user_content = f"[KONTEKS]:\n{stdin_text}\n\n[INPUT]:\n{args.prompt}"
     else:
-        user_content = args.prompt
-    
-    messages = []
-    
-    if cfg.system_prompt:
-        messages.append({
-            "role": "system",
-            "content": cfg.system_prompt
-        })
+        user_content = stdin_text or args.prompt
         
+    messages = []
+    if cfg.system_prompt:
+        messages.append({"role": "system", "content": cfg.system_prompt})
     if user_content:
-        messages.append({
-            "role": "user",
-            "content": user_content
-        })
+        messages.append({"role": "user", "content": user_content})
         
     payload = {
-        "model": args.model,
+        "model": model,
         "messages": messages,
         "max_tokens": cfg.max_tokens,
         "temperature": cfg.temperature,
         "top_p": cfg.top_p,
         "stream": not args.no_stream,
     }
-
+    
     with httpx.Client(timeout=None) as client:
         if args.raw:
             if args.no_stream:
@@ -577,9 +780,9 @@ def main():
             if args.no_stream:
                 r = client.post(endpoint, headers=headers, json=payload)
                 r.raise_for_status()
-                
-                text = r.json()["choices"][0]["message"]["content"]
-                StreamCollector().collect_text(text)
+                StreamCollector().collect_text(
+                    r.json()["choices"][0]["message"]["content"]
+                )
             else:
                 with client.stream("POST", endpoint, headers=headers, json=payload) as r:
                     r.raise_for_status()
