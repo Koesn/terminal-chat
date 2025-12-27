@@ -311,7 +311,7 @@ def interactive_loop(model, cfg, endpoint, headers):
             continue
 
         if user.startswith("/cmd"):
-            print("Use CLI args for config in interactive.")
+            handle_cmd(user, cfg, convo)
             continue
 
         convo.add("user", user)
@@ -333,6 +333,50 @@ def interactive_loop(model, cfg, endpoint, headers):
 
         convo.add("assistant", text)
         print()
+
+def handle_cmd(line, cfg, convo):
+    parts = line.split(maxsplit=2)
+    if len(parts) < 2:
+        print("Usage: /cmd <option> <value>")
+        return
+    
+    cmd = parts[1]
+    val = parts[2] if len(parts) > 2 else None
+    
+    try:
+        if cmd == "temperature":
+            cfg.temperature = float(val)
+        elif cmd == "top_p":
+            cfg.top_p = float(val)
+        elif cmd == "max_tokens":
+            cfg.max_tokens = int(val)
+        elif cmd == "history":
+            convo.max_pairs = int(val)
+            convo.messages = convo.messages[-convo.max_pairs * 2 :]
+        elif cmd == "system_prompt":
+            cfg.system_prompt = val
+        elif cmd == "show":
+            print({
+                "max_tokens": cfg.max_tokens,
+                "temperature": cfg.temperature,
+                "top_p": cfg.top_p,
+                "system_prompt": cfg.system_prompt,
+                "history_pairs": convo.max_pairs,
+            })
+        elif cmd == "help":
+            print(
+                "/cmd temperature <float>\n"
+                "/cmd top_p <float>\n"
+                "/cmd max_tokens <int>\n"
+                "/cmd history <int>\n"
+                "/cmd system_prompt <text>\n"
+                "/cmd show\n"
+                "/cmd help"
+            )
+        else:
+            print("Unknown command. Type /cmd help.")
+    except Exception as e:
+        print(f"Invalid value: {e}")
 
 # ======================================================
 # CLI
