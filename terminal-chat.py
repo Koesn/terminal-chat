@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import readline
+readline.parse_and_bind("tab: complete")
 import os
 import httpx
 import json
@@ -9,6 +11,16 @@ import textwrap
 import re
 import sys
 from prettytable import PrettyTable
+import atexit
+
+HISTORY_FILE = os.path.expanduser("~/.terminal-chat-history")
+
+try:
+    readline.read_history_file(HISTORY_FILE)
+except FileNotFoundError:
+    pass
+    
+atexit.register(readline.write_history_file, HISTORY_FILE)
 
 # ======================================================
 # TERMINAL
@@ -16,6 +28,9 @@ from prettytable import PrettyTable
 class Terminal:
     def __init__(self):
         self.ansi = sys.stdout.isatty()
+        
+    def disable_ansi(self):
+        self.ansi = False
 
     def width(self):
         return shutil.get_terminal_size((80, 20)).columns
@@ -29,6 +44,8 @@ ANSI_RESET = TERM.color("\033[0m")
 ANSI_BOLD  = TERM.color("\033[1m")
 ANSI_WHITE = TERM.color("\033[97m")
 ANSI_GRAY  = TERM.color("\033[90m")
+MAX_STDIN_CHARS = 10000
+STYLE_MODE = "rich"
 
 # ======================================================
 # MARKDOWN → ANSI
@@ -36,22 +53,50 @@ ANSI_GRAY  = TERM.color("\033[90m")
 class Markdown:
     @staticmethod
     def style(text: str) -> str:
+        global STYLE_MODE
+        
+        # CLEAN MODE: human-readable prose
+        if STYLE_MODE == "clean":
+            # remove bold / italic markers
+            text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+            text = re.sub(r"\*(.+?)\*", r"\1", text)
+            
+            # strip heading hashes but KEEP the text
+            text = re.sub(r"^#{1,6}\s+", "", text)
+            
+            # markdown horizontal rule (---, ----, etc) → remove
+            if re.match(r"^\s*-{3,}\s*$", text):
+                return None
+            
+            # remove blockquote marker '>'
+                text = re.sub(r"^\s*>\s?", "", text)
+                
+            return text.rstrip()
+        
+        # PLAIN MODE: no ANSI, no transformation
+        if not TERM.ansi:
+            return text
+        
+        # RICH MODE (existing behavior)
         text = re.sub(
             r"\*\*(.+?)\*\*",
-            lambda m: f"{ANSI_BOLD}{ANSI_WHITE}{m.group(1)}{ANSI_RESET}",
+            lambda m: f"{ANSI_BOLD}{m.group(1)}{ANSI_RESET}",
             text
         )
+        
         text = re.sub(
             r"\*(.+?)\*",
             lambda m: f"{ANSI_GRAY}{m.group(1)}{ANSI_RESET}",
             text
         )
+        
         text = re.sub(
-            r"^(\d+\.)",
-            lambda m: f"{ANSI_BOLD}{m.group(1)}{ANSI_RESET}",
+            r"^(#{1,3})\s+(.*)$",
+            lambda m: f"{ANSI_BOLD}{m.group(2)}{ANSI_RESET}",
             text,
             flags=re.MULTILINE
         )
+        
         return text
 
 # ======================================================
@@ -60,7 +105,10 @@ class Markdown:
 class Renderer:
     @staticmethod
     def prose(line: str):
-        styled = Markdown.style(line.rstrip("\n"))
+        styled = Markdown.style(line.rstrip("\n").rstrip())
+        if styled is None:
+            return
+        
         wrapped = textwrap.fill(
             styled,
             width=TERM.width(),
@@ -100,6 +148,12 @@ class Renderer:
             table.max_width[h] = max_col_width
 
         for r in rows:
+            # NORMALISASI JUMLAH KOLOM
+            if len(r) < col_count:
+                r = r + [""] * (col_count - len(r))
+            elif len(r) > col_count:
+                r = r[:col_count]
+                
             rendered = []
             for cell in r:
                 styled = Markdown.style(cell)
@@ -114,6 +168,20 @@ class Renderer:
                     )
                 )
                 rendered.append(wrapped)
+                
+            
+            wrapped = "\n".join(
+                line.rstrip()
+                for line in textwrap.wrap(
+                    styled,
+                    width=max_col_width,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                    replace_whitespace=False,
+                    drop_whitespace=False,
+                )
+            )
+            
             table.add_row(rendered)
 
         print(table)
@@ -294,7 +362,7 @@ class Conversation:
 
 def interactive_loop(model, cfg, endpoint, headers):
     convo = Conversation(cfg.history)
-    print("Interactive mode. Type /cmd help or /bye\n")
+    print('Welcome to Terminal Chat v0.3.2.\nType "/cmd help" to engage command or "/bye" to end chat.\n')
 
     while True:
         try:
@@ -379,11 +447,35 @@ def handle_cmd(line, cfg, convo):
         print(f"Invalid value: {e}")
 
 # ======================================================
+# STDIN PIPE
+# ======================================================
+
+def read_stdin():
+    """
+    Read piped stdin with safety truncation.
+    """
+    if not sys.stdin.isatty():
+        data = sys.stdin.read()
+        if not data:
+            return None
+        
+        data = data.strip()
+        
+        if len(data) > MAX_STDIN_CHARS:
+            return (
+                data[:MAX_STDIN_CHARS]
+                + "\n\n[...STDIN TRUNCATED...]"
+            )
+        
+        return data
+    return None
+
+# ======================================================
 # CLI
 # ======================================================
 def main():
     p = argparse.ArgumentParser(
-        "chat-cli v0.3",
+        "terminal-chat v0.3",
         description="Streaming AI chat CLI with rich terminal rendering",
     )
 
@@ -397,10 +489,18 @@ def main():
     p.add_argument("--history", type=int, default=10, help="History pairs (interactive)")
     p.add_argument("-r", "--raw", action="store_true", help="Raw output (CLI only)")
     p.add_argument("--no-stream", action="store_true", help="Disable streaming (CLI only)")
+    p.add_argument("--style", choices=["rich", "plain", "clean"], default="rich", help="Output style: rich, plain, or clean (human-readable)")
 
     args = p.parse_args()
-
-    if len(sys.argv) == 1:
+    global STYLE_MODE
+    STYLE_MODE = args.style
+    
+    if args.style in ("plain", "clean"):
+        TERM.disable_ansi()
+    
+    stdin_text = read_stdin()
+    
+    if len(sys.argv) == 1 and not stdin_text:
         p.print_help()
         sys.exit(0)
 
@@ -428,11 +528,37 @@ def main():
         interactive_loop(args.model, cfg, endpoint, headers)
         return
 
+    user_content = None
+    
+    if stdin_text and args.prompt:
+        user_content = (
+            "[KONTEKS]:\n"
+            f"{stdin_text}\n\n"
+            "[INPUT]:\n"
+            f"{args.prompt}"
+        )
+    elif stdin_text:
+        user_content = stdin_text
+    else:
+        user_content = args.prompt
+    
+    messages = []
+    
+    if cfg.system_prompt:
+        messages.append({
+            "role": "system",
+            "content": cfg.system_prompt
+        })
+        
+    if user_content:
+        messages.append({
+            "role": "user",
+            "content": user_content
+        })
+        
     payload = {
         "model": args.model,
-        "messages": (
-            [{"role": "system", "content": cfg.system_prompt}] if cfg.system_prompt else []
-        ) + [{"role": "user", "content": args.prompt}],
+        "messages": messages,
         "max_tokens": cfg.max_tokens,
         "temperature": cfg.temperature,
         "top_p": cfg.top_p,
