@@ -46,42 +46,74 @@ chmod +x terminal-chat.py
 terminal-chat reads configuration from environment variables.
 
 Set the API endpoint and API key:
-```bash
+
 export CHAT_CLI_ENDPOINT="https://YOUR_API_ENDPOINT/v1/chat/completions"
 export CHAT_CLI_KEY="YOUR_API_KEY"
-```
+
 These variables must be set before running the CLI.
 
 ---
 
 ## Usage
 
-### Basic usage (streaming mode)
+Common usage
+```bash
+terminal-chat.py <args>
+```
+Argument options:
+```bash
+  -h, --help            show this help message and exit
+  -p PROMPT, --prompt PROMPT
+                        One-shot prompt (CLI mode)
+  -i, --interactive     Interactive chat mode
+  -m MODEL, --model MODEL
+                        Model name
+  --max-tokens MAX_TOKENS
+                        Max tokens
+  --temperature TEMPERATURE
+                        Sampling temperature
+  --top-p TOP_P         Top-p sampling
+  --system-prompt SYSTEM_PROMPT
+                        System prompt
+  --history HISTORY     History pairs (interactive)
+  -r, --raw             Raw output (CLI only)
+  --no-stream           Disable streaming (CLI only)
+```
+
+---
+
+### Examples
+
+#### Basic usage (streaming mode)
 ```bash
 ./terminal-chat.py -p "Explain artificial intelligence in simple terms"
 ```
-### Specify model
+#### Specify model
 ```bash
 ./terminal-chat.py -p "Explain the rule of law" -m tugasi-chat
 ```
-### Non-streaming mode
+#### Non-streaming mode
+
 Wait for the full response before rendering (useful for clean tables):
 ```bash
 ./terminal-chat.py -p "Explain fintech regulation in Indonesia" --no-stream
 ```
-### Raw output mode (automation-friendly)
 
-Disable all terminal formatting.
+#### Raw Output Mode (Automation-Friendly)
 
-### Non-streaming raw output:
+Raw mode disables all terminal formatting and is intended for scripting and pipelines.
+
+##### Non-streaming raw output
 ```bash
 ./terminal-chat.py -p "Summarize contract law in 5 points" --raw --no-stream
 ```
-### Streaming raw output:
+##### Streaming raw output
 ```bash
 ./terminal-chat.py -p "Explain AI alignment" --raw
 ```
-### System prompt
+---
+
+## System Prompt
 
 Control model behavior:
 ```bash
@@ -89,24 +121,74 @@ Control model behavior:
   -p "Analyze legal risk of a startup" \
   --system-prompt "You are a legal analyst. Answer concisely and structurally."
 ```
-### Sampling parameters
+---
+
+## Sampling Parameters
 ```bash
 ./terminal-chat.py \
   -p "Generate a policy outline" \
   --temperature 0.2 \
   --top-p 0.9
 ```
-### Interactive mode
+
+---
+
+## Interactive Mode (REPL)
+
+### Start interactive mode:
 ```bash
 ./terminal-chat.py --interactive
 ```
-In interactive mode:
+### Basic Interaction
 - Type prompts after >
-- Conversation history is preserved automatically
-- Use /bye to exit
-### Command-Line Help
+- Responses are streamed and rendered automatically
+- Conversation history is preserved
+- Use /bye to exit the session
 
-Run without arguments to see full help:
+---
+
+## Interactive Commands (/cmd)
+
+Inside interactive mode, runtime parameters can be modified without restarting.
+
+Available Commands
+```bash
+/cmd temperature <float>
+/cmd top_p <float>
+/cmd max_tokens <int>
+/cmd history <int>
+/cmd system_prompt <text>
+/cmd show
+/cmd help
+```
+### Examples
+
+Change temperature during session:
+```bash
+/cmd temperature 0.3
+```
+Update system prompt dynamically:
+```bash
+/cmd system_prompt You are a senior legal consultant. Answer formally.
+```
+Adjust conversation history depth:
+```bash
+/cmd history 20
+```
+Inspect current session configuration:
+```bash
+/cmd show
+```
+Notes
+- /cmd is only available in interactive mode
+- Changes apply to all subsequent prompts in the same session
+- CLI modes (--raw, --no-stream) are unaffected
+
+---
+
+## Command-Line Help
+
+Run without arguments to display full help:
 ```bash
 ./terminal-chat.py
 ```
