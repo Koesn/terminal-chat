@@ -511,80 +511,146 @@ class Conversation:
         msgs.extend(self.messages[-self.max_pairs * 2 :])
         return msgs
 
+def read_multiline(prompt="| ", end_cmd="/end", cancel_cmd="/cancel"):
+    print("(multiline mode — type /end to submit, /cancel to abort)")
+    lines = []
+    
+    while True:
+        try:
+            line = input(prompt)
+        except EOFError:
+            return None
+        
+        cmd = line.strip()
+        if cmd == cancel_cmd:
+            print("(multiline aborted)")
+            return None
+        
+        if cmd == end_cmd:
+            break
+        
+        lines.append(line)
+        
+    return "\n".join(lines).rstrip()
+
+def print_multiline_status(text):
+    chars = len(text)
+    lines = text.count("\n") + 1 if text else 0
+    print(f"[multiline] {lines} lines, {chars} chars\n")
+    
 def interactive_loop(model, cfg, endpoint, headers):
     convo = Conversation(cfg.history)
     
     # LOAD persistent conversation history
     convo.messages = load_conversation_history()
     print(
-        'Welcome to Terminal Chat v0.4.0.\n'
+        'Welcome to Terminal Chat v0.4.1.\n'
         'Type "/cmd help" to engage command or "/bye" to end chat.\n'
+        'Use "/multiline" to enter multiline mode/paste large text, put "/end" in new line to send.\n'
         f'Conversation restored. '
         f'Storage cap {CONVERSATION_STORE_LIMIT} messages. '
         f'Context cap {cfg.history} pairs.\n'
     )
-
+    
     while True:
         try:
             user = input("> ").strip()
+            
+            # ======================================================
+            # EXIT
+            # ======================================================
+            if user == "/bye":
+                save_conversation_history(convo.messages)
+                print("\nbye 👋\n")
+                break
+            
+            if not user:
+                continue
+            
+            # ======================================================
+            # COMMANDS
+            # ======================================================
+            if user.startswith("/cmd"):
+                handle_cmd(user, cfg, convo)
+                continue
+            
+            # ======================================================
+            # EXPLICIT MULTILINE MODE (EXCLUSIVE)
+            # ======================================================
+            if user == "/multiline":
+                content = read_multiline()
+                if not content:
+                    continue
+                
+                print_multiline_status(content)
+                user = content
+                
+            # ======================================================
+            # IMPLICIT MULTILINE (PASTE / MANUAL)
+            # ======================================================
+            elif "\n" in user:
+                lines = [user.rstrip("\n")]
+                while True:
+                    line = input()
+                    if line.strip() == "":
+                        break
+                    lines.append(line)
+                    
+                user = "\n".join(lines).rstrip()
+                print_multiline_status(user)
+                
+            # ======================================================
+            # FINAL SAFETY
+            # ======================================================
+            if not user:
+                continue
+            
+            # ======================================================
+            # SEND TO LLM
+            # ======================================================
+            convo.add("user", user)
+            print()
+            
+            payload = {
+                "model": cfg.model,
+                "messages": convo.build(cfg.system_prompt),
+                "max_tokens": cfg.max_tokens,
+                "temperature": cfg.temperature,
+                "top_p": cfg.top_p,
+                "stream": True,
+            }
+            
+            with httpx.Client(timeout=None) as client:
+                try:
+                    with client.stream(
+                        "POST",
+                        endpoint,
+                        headers=headers,
+                        json=payload
+                    ) as r:
+                        r.raise_for_status()
+                        text = StreamCollector().collect(r)
+                    
+                except httpx.HTTPStatusError as e:
+                    handle_http_error(e, endpoint, cfg.model)
+                    return
+                
+                except httpx.RequestError as e:
+                    print()
+                    print("❌ Network error while connecting to endpoint")
+                    print(f"Detail: {e}")
+                    print()
+                    return
+                
+            # COMPLETE PAIR
+            convo.add("assistant", text)
+            save_conversation_history(convo.messages)
+            print()
+            
         except EOFError:
             save_conversation_history(convo.messages)
             print("\nbye.")
             break
-
-        if user == "/bye":
-            save_conversation_history(convo.messages)
-            print("\nbye 👋\n")
-            break
-
-        if not user:
-            continue
-
-        if user.startswith("/cmd"):
-            handle_cmd(user, cfg, convo)
-            continue
-
-        convo.add("user", user)
-        print()
-
-        payload = {
-            "model": cfg.model,
-            "messages": convo.build(cfg.system_prompt),
-            "max_tokens": cfg.max_tokens,
-            "temperature": cfg.temperature,
-            "top_p": cfg.top_p,
-            "stream": True,
-        }
-
-        with httpx.Client(timeout=None) as client:
-            try:
-                with client.stream(
-                    "POST",
-                    endpoint,
-                    headers=headers,
-                    json=payload
-                ) as r:
-                    r.raise_for_status()
-                    text = StreamCollector().collect(r)
-                
-            except httpx.HTTPStatusError as e:
-                handle_http_error(e, endpoint, cfg.model)
-                return
-            
-            except httpx.RequestError as e:
-                print()
-                print("❌ Network error while connecting to endpoint")
-                print(f"Detail: {e}")
-                print()
-                return
-                
-        # COMPLETE PAIR: user + assistant
-        convo.add("assistant", text)
-        
-        # 🔐 SAVE IMMEDIATELY (CRASH-SAFE)
-        save_conversation_history(convo.messages)
-        
-        print()
 
 def handle_cmd(line, cfg, convo):
     parts = line.split(maxsplit=2)
